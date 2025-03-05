@@ -1,148 +1,132 @@
-import discord, os, random, json
-from discord.ext.commands import Bot, Context, max_concurrency, BucketType, cooldown, MemberConverter
-from discord.ext.commands.errors import CommandOnCooldown
+import discord
+import os
+import random
+import json
+import requests
+from discord.ext.commands import Bot, Context, cooldown, BucketType, MemberConverter, CommandOnCooldown
 from dotenv import load_dotenv
 from time import sleep, time
-from roastedbyai import Conversation, MessageLimitExceeded, CharacterLimitExceeded, Style
 
+# Load environment variables
 load_dotenv()
 
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
-
 bot = Bot(command_prefix="r!", intents=intents, help_command=None)
-bot.__version__ = "1.2.0"
+bot.__version__ = "1.2.3"
 mc = MemberConverter()
 
-# Load roast messages
-with open("database/roast.json", "r", encoding="UTF-8") as f:
-    roasts = json.load(f)
+# Logging function
+def log_message(msg):
+    print(f"[BOT LOG] {msg}")
 
+# 🔹 Network test function
+def test_network():
+    log_message("Testing network connectivity...")
+    try:
+        response = requests.get("https://discord.com", timeout=5)
+        if response.status_code == 200:
+            log_message("✅ Internet connection working!")
+            return True
+        else:
+            log_message("⚠️ Warning: Internet may be unstable!")
+            return False
+    except requests.RequestException:
+        log_message("❌ No internet connection detected!")
+        return False
+
+# Load roast data
+try:
+    with open("database/roast.json", "r", encoding="UTF-8") as f:
+        roasts = json.load(f)
+    log_message("✅ Roast data loaded successfully!")
+except FileNotFoundError:
+    log_message("❌ Error: 'roast.json' file not found! Please check the path.")
+    exit(1)
+
+# Bot ready event
 @bot.event
 async def on_ready():
-    print("Bot logged in as {}".format(bot.user))
+    log_message(f"✅ Bot is online as {bot.user}")
 
-@bot.command(name="roast", description="Start an AI roast session.")
-@max_concurrency(1, BucketType.user)
+# 🔹 Ping command
+@bot.command(name="ping", help="Check bot latency.")
+async def ping(ctx: Context):
+    latency = round(bot.latency * 1000)  # Convert to ms
+    await ctx.send(f"🏓 Pong! Latency: `{latency}ms`")
+
+# 🔹 Network test command
+@bot.command(name="network", help="Check internet connection.")
+async def network(ctx: Context):
+    if test_network():
+        await ctx.send("✅ Network is working fine!")
+    else:
+        await ctx.send("❌ No internet connection detected!")
+
+# 🔹 Roast command (single roast)
+@bot.command(name="roast", description="Roast yourself or someone else!")
 @cooldown(1, 30, BucketType.user)
-async def _roast(ctx: Context, target: str = None, *, style: str = "default"):
-    if target != "me":
+async def roast(ctx: Context, target: str = None):
+    if target and target.lower() == "me":
+        await start_roast_battle(ctx)
+        return
+
+    if target:
         try:
             target = await mc.convert(ctx, target)
         except:
             target = None
-        await _roast_someone(ctx, target)
-        return
+    roast_target = target or ctx.author
+    roast_message = random.choice(roasts).replace("{mention}", f"**{roast_target.display_name}**")
+    await ctx.send(f"{roast_target.mention} {roast_message}")
 
-    style = style.lower().replace(" ", "_")
-    if style not in Style.all:
-        await ctx.reply(f"Invalid style! Use `{bot.command_prefix}help roast` for valid styles.")
-        return
-
-    pb = PromptButtons(ctx, style=style)
-    msg = await ctx.reply(
-        "We'll be taking turns roasting each other. Are you sure you can handle this?",
-        view=pb
+# 🔹 Interactive Roast Battle
+async def start_roast_battle(ctx: Context):
+    await ctx.send(
+        f"🔥 {ctx.author.mention}, you think you can handle this? Alright, let's take turns roasting each other!\n"
+        f"Type your best roast, or say **stop** to quit!"
     )
-    pb.msg = msg
 
-class PromptButtons(discord.ui.View):
-    def __init__(self, ctx, style, *, timeout=180):
-        super().__init__(timeout=timeout)
-        self.ctx = ctx
-        self.style = style
-
-    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
-            return
-
-        await interaction.response.defer()
-        await _roast_battle(self.ctx, prev_msg=self.msg, style=self.style)
-
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
-            return
-        await self.msg.edit(content="You chickened out of the roast battle.", view=None)
-
-class RoastBattleCancel(discord.ui.View):
-    def __init__(self, ctx, convo, *, timeout=180):
-        super().__init__(timeout=timeout)
-        self.ctx = ctx
-        self.convo = convo
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.grey)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
-            return
-        self.convo.kill()
-        await interaction.message.edit(content="Roast battle ended.", view=None)
-
-async def _roast_battle(ctx: Context, prev_msg: discord.Message, *, style: str = Style.default):
-    convo = Conversation(style)
-
-    def check(m: discord.Message):
+    def check(m):
         return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
 
-    prev_msg = None
-    while convo.alive:
+    while True:
         try:
-            msg = await bot.wait_for("message", check=check, timeout=300)
-
-            response = convo.send(msg.content)
-            print(f"API Response: {response}")  # Debugging log
-
-            if not response or response.strip() == "":
-                await ctx.reply("Oops! I couldn't generate a roast this time. Try again.")
-                return
-
+            msg = await bot.wait_for("message", check=check, timeout=120)
             if msg.content.lower() in ["stop", "quit"]:
-                await ctx.channel.send(f"{ctx.author.mention} quit the battle. Weak!")
-                convo.kill()
+                await ctx.send("😆 You chickened out! Better luck next time.")
                 return
 
-            rbc = RoastBattleCancel(ctx, convo)
-            prev_msg = await msg.reply(response, view=rbc)
+            roast_response = random.choice(roasts).replace("{mention}", f"**{ctx.author.display_name}**")
+            await ctx.send(roast_response)
 
         except TimeoutError:
-            convo.kill()
-            await ctx.send(f"{ctx.author.mention} roast session timed out.")
+            await ctx.send("⏳ You took too long! Roast battle over.")
             return
 
-async def _roast_someone(ctx: Context, target: discord.Member = None):
-    if target is None:
-        await ctx.reply("Mention someone to roast!")
-        return
-    elif target.id == ctx.author.id:
-        await ctx.reply("Why roast yourself? Go find an enemy!")
-        return
-    elif target.id == bot.user.id:
-        await ctx.reply("You can't roast me, I'm invincible!")
-        return
+# 🔹 Help command
+@bot.command(name="help", description="Show available commands.")
+async def help(ctx: Context):
+    help_msg = "**📜 Available Commands:**\n"
+    for command in bot.commands:
+        help_msg += f"**`{bot.command_prefix}{command.name}`** - {command.help}\n"
+    await ctx.send(help_msg)
 
-    roast = random.choice(roasts).replace("{mention}", target.mention)
-    await ctx.channel.send(roast)
-
+# 🔹 Error handling
 @bot.event
-async def on_command_error(ctx, ex):
-    if isinstance(ex, CommandOnCooldown):
-        await ctx.reply(f"You're on cooldown. Try again in **{round(ex.retry_after, 1)}s**.")
-
-@bot.command(name="help", description="Shows the help menu.")
-async def help(ctx: Context, *, command: str = None):
-    if command is None:
-        helpmsg = f"# {bot.user.display_name} Help Menu\n"
-        for cmd in bot.walk_commands():
-            helpmsg += f"## - `{cmd.qualified_name}`\n> {cmd.description or 'No description provided.'}\n"
+async def on_command_error(ctx, error):
+    if isinstance(error, CommandOnCooldown):
+        await ctx.reply(f"⏳ Cooldown active! Try again in **{round(error.retry_after, 1)}s**")
     else:
-        cmd = bot.get_command(command)
-        helpmsg = f"# `{command}`\n" + (cmd.help if cmd else "This command does not exist.")
-    await ctx.reply(helpmsg)
+        log_message(f"⚠️ Error: {error}")
 
+# Start bot
 if __name__ == "__main__":
-    PORT = os.getenv("PORT", 5000)  # Ensure port is set for Render
-    bot.run(os.environ.get("TOKEN"), reconnect=True)
+    if not test_network():
+        exit(1)  # Stop bot if no network
+    TOKEN = os.getenv("TOKEN")
+    if not TOKEN:
+        log_message("❌ ERROR: Discord Bot Token not found in environment variables!")
+        exit(1)
+    bot.run(TOKEN, reconnect=True)
