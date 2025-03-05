@@ -1,90 +1,108 @@
-import discord, os, random, json, requests
-from discord.ext.commands import Bot, Context, max_concurrency, BucketType, cooldown
-from discord.ext.commands.errors import CommandOnCooldown
-from dotenv import load_dotenv
+import discord
+import os
+import random
+import json
+import requests
 from time import sleep, time
+from dotenv import load_dotenv
+from discord.ext.commands import Bot, Context, cooldown, BucketType, MemberConverter, CommandOnCooldown
 from roastedbyai import Conversation, MessageLimitExceeded, CharacterLimitExceeded, Style
 
+# Load environment variables
 load_dotenv()
 
-# Using the bot's ID as prefix
+# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
 bot = Bot(command_prefix="r!", intents=intents, help_command=None)
 bot.__version__ = "1.2.1"
+mc = MemberConverter()
 
-# Load roasts from JSON file
+# Load roasts database
 with open("database/roast.json", "r", encoding="UTF-8") as f:
     roasts = json.load(f)
+
 
 @bot.event
 async def on_ready():
     print(f"✅ Bot is online as {bot.user}")
 
-# 🔥 Roast Battle Command
-@bot.command(name="roast", description="Start an AI roast session.")
-@max_concurrency(1, BucketType.user)
-@max_concurrency(4, BucketType.channel)
-@max_concurrency(12, BucketType.guild)
+
+### --- 🔥 ROAST COMMAND --- ###
+@bot.command(name="roast", description="Start an AI roast battle. Take turns roasting each other.")
 @cooldown(1, 30, BucketType.user)
-async def _roast(ctx: Context, target: str = None, *, style: str = "default"):
-    if target != "me":
-        await _roast_someone(ctx, target)
+async def roast(ctx: Context, target: str = None, *, style: str = "default"):
+    """AI Roast Battle Command"""
+    if target and target.lower() != "me":
+        try:
+            target = await mc.convert(ctx, target)
+        except:
+            target = None
+        await roast_someone(ctx, target)
         return
 
     style = style.lower().replace(" ", "_")
     if style not in Style.all:
-        await ctx.reply(f"❌ Invalid style. Use `{bot.command_prefix}help roast` for options.")
+        await ctx.reply(f"❌ Invalid style. Use `{bot.command_prefix}help roast` for a list of styles.")
         return
 
-    pb = PromptButtons()
-    msg = await ctx.reply("🔥 Ready to get roasted? Click **Confirm** to continue!", view=pb)
-    pb.msg, pb.ctx, pb.style = msg, ctx, style
+    view = RoastPrompt(ctx, style)
+    msg = await ctx.reply(
+        "🔥 We'll take turns roasting each other. Are you sure you can handle it?",
+        view=view
+    )
+    view.msg = msg
 
-# 📌 Buttons for roast confirmation
-class PromptButtons(discord.ui.View):
-    def __init__(self, *, timeout=180):
+
+### --- 🎭 ROAST BUTTON PROMPT --- ###
+class RoastPrompt(discord.ui.View):
+    def __init__(self, ctx, style, *, timeout=180):
         super().__init__(timeout=timeout)
-        self.msg, self.ctx, self.style = None, None, None
+        self.ctx = ctx
+        self.style = style
 
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
-    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("❌ Not your battle!", ephemeral=True)
+            await interaction.response.send_message("⚠️ This is not your roast battle.", ephemeral=True)
             return
 
-        await self.msg.edit(content="🔥 Let’s get roasting! Send your best roast.", view=None)
-        stop_view = RoastBattleCancel()
-        msg = await self.ctx.send(f"{self.ctx.author.mention} Start roasting! Type **stop** to end.", view=stop_view)
-        await start_roast_battle(self.ctx, msg, stop_view)
+        stop_view = RoastStop(self.ctx)
+        await self.msg.edit(content="🔥 You accepted the roast battle. Bring it on!", view=None)
+        await self.ctx.send(f"{self.ctx.author.mention}, give me your best roast!", view=stop_view)
+        await start_roast_battle(self.ctx, self.style, stop_view)
 
     @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("❌ Not your battle!", ephemeral=True)
+            await interaction.response.send_message("⚠️ This is not your roast battle.", ephemeral=True)
             return
-        await self.msg.edit(content="🚫 Roast battle canceled.", view=None)
 
-# 🔴 Stop Button
-class RoastBattleCancel(discord.ui.View):
-    def __init__(self, *, timeout=180):
+        await self.msg.edit(content="❌ You chickened out of the roast battle.", view=None)
+
+
+### --- 🚫 ROAST STOP BUTTON --- ###
+class RoastStop(discord.ui.View):
+    def __init__(self, ctx, *, timeout=180):
         super().__init__(timeout=timeout)
-        self.ctx, self.convo = None, None
+        self.ctx = ctx
+        self.convo = None
 
     @discord.ui.button(label="Stop", style=discord.ButtonStyle.grey)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+    async def stop(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("❌ Not your battle!", ephemeral=True)
+            await interaction.response.send_message("⚠️ This is not your roast battle.", ephemeral=True)
             return
-        self.convo.kill()
-        self.convo.killed = True
-        await interaction.message.edit(content="🔥 Roast battle ended!", view=None)
-        await interaction.response.send_message("Boo! You quit early!")
 
-# 🧠 AI Roast Battle (Chatbot-like)
-async def start_roast_battle(ctx: Context, prev_msg: discord.Message, view: RoastBattleCancel):
-    convo = Conversation(view.ctx.style)
-    view.ctx, view.convo = ctx, convo
+        self.convo.kill()
+        await interaction.message.edit(content="🚫 Roast battle stopped.", view=None)
+        await interaction.response.send_message("Boo, you're no fun!")
+
+
+### --- 🔄 ROAST BATTLE FUNCTION --- ###
+async def start_roast_battle(ctx: Context, style: str, view: RoastStop):
+    convo = Conversation(style)
+    view.convo = convo
 
     def check(m: discord.Message):
         return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
@@ -92,83 +110,89 @@ async def start_roast_battle(ctx: Context, prev_msg: discord.Message, view: Roas
     while convo.alive:
         try:
             msg: discord.Message = await bot.wait_for("message", check=check, timeout=300)
-            raw_response = requests.post(convo._Conversation__url, json={"input": msg.content}, headers=convo._Conversation__headers)
-            print(f"🔍 API Response: {raw_response.text}")  # Debugging
-
-            response = raw_response.json().get("content", None)
             if msg.content.lower() in ["stop", "quit"]:
-                await ctx.send("🔥 Roast battle ended! You ran away like a chicken. 🐔")
+                await ctx.send("🚫 Roast battle ended. You couldn't handle the heat!")
                 convo.kill()
                 return
 
+            await ctx.typing()
+            response = convo.send(msg.content)
             if not response:
                 await ctx.reply("⚠️ AI didn't respond! Try again.")
                 continue
 
-            prev_msg = await msg.reply(response, view=view)
+            await msg.reply(response, view=view)
 
-        except (requests.exceptions.JSONDecodeError, MessageLimitExceeded, CharacterLimitExceeded) as e:
-            await ctx.reply("⚠️ Too much roasting! Try again.")
-            print(f"API Error: {e}")
-            return
-        except TimeoutError:
-            await ctx.send("⏳ You took too long. Roast battle ended.")
-            convo.kill()
+        except Exception as e:
+            await ctx.reply("⚠️ AI Error. Try again later.")
+            print(f"❌ API Error: {e}")
             return
 
-# 🎯 Roast Someone
-async def _roast_someone(ctx: Context, target: str = None):
-    if not target:
-        await ctx.reply(random.choice([
-            "🔥 Forgot to mention someone! Who do you want to roast?",
-            "🚨 Name someone to roast!"
-        ]))
+
+### --- 🎯 ROAST SOMEONE COMMAND --- ###
+async def roast_someone(ctx: Context, target: discord.Member = None):
+    """Roast someone directly"""
+    if target is None:
+        await ctx.reply("You forgot to mention someone to roast! 😆")
+        return
+    if target.id == ctx.author.id:
+        await ctx.reply("😂 You want to roast yourself? That's some next-level self-burn.")
+        return
+    if target.id == bot.user.id:
+        await ctx.reply("I’m flawless. I don’t roast myself. 😎")
         return
 
-    roast = random.choice(roasts)
-    roast_msg = f"{target} {roast}" if type(roast) is str else roast[0]
-    await ctx.send(roast_msg)
+    roast = random.choice(roasts).replace("{mention}", target.mention)
+    await ctx.channel.send(roast)
 
-# 📢 Help Command
-@bot.command(name="help", description="Shows available commands.")
-async def help(ctx: Context, *, command: str = None):
-    if command:
-        cmd = bot.get_command(command)
-        helpmsg = f"**`{command}`**\n{cmd.help if cmd else '❌ Command not found.'}"
-    else:
-        helpmsg = "**🔹 Available Commands:**\n"
-        for cmd in bot.walk_commands():
-            helpmsg += f"🔹 `{cmd.qualified_name}` - {cmd.description or 'No description.'}\n"
-    await ctx.reply(helpmsg)
 
-# 📶 Ping Command
+### --- 📌 GENERAL COMMANDS --- ###
 @bot.command(name="ping", description="Check bot latency.")
 async def ping(ctx: Context):
-    await ctx.reply(f"🏓 Pong! Latency: **{round(bot.latency * 1000)}ms**")
+    """Returns the bot's ping"""
+    latency = round(bot.latency * 1000, 2)
+    await ctx.reply(f"🏓 Pong! Latency: `{latency}ms`")
 
-# 🔄 Version Command
-@bot.command(name="version", description="Show bot version.")
+
+@bot.command(name="version", description="Show bot version info.")
 async def version(ctx: Context):
-    await ctx.reply(f"**🤖 Bot Version:** `{bot.__version__}`")
+    """Returns the bot version"""
+    await ctx.reply(f"🤖 Bot Version: `{bot.__version__}`")
 
-# 🌐 Network Test Command
-@bot.command(name="network", description="Check API connectivity.")
+
+@bot.command(name="network", description="Test network connectivity.")
 async def network(ctx: Context):
+    """Checks if the bot can access the internet"""
     try:
-        response = requests.get("https://www.google.com", timeout=5)
-        if response.status_code == 200:
-            await ctx.reply("✅ Network connection: **OK**")
-        else:
-            await ctx.reply("⚠️ Network issue detected!")
-    except requests.exceptions.RequestException:
-        await ctx.reply("❌ No network connection!")
+        requests.get("https://www.google.com", timeout=5)
+        await ctx.reply("✅ Network is working fine!")
+    except requests.ConnectionError:
+        await ctx.reply("❌ No internet connection detected!")
 
-# 🚀 Handle Cooldowns
+
+@bot.command(name="help", description="Shows the help menu.")
+async def help(ctx: Context, command: str = None):
+    """Shows the help menu."""
+    if command is None:
+        help_msg = f"📜 **{bot.user.display_name} Help Menu**\n\n"
+        for cmd in bot.walk_commands():
+            help_msg += f"🔹 `{cmd.qualified_name}` - {cmd.description or 'No description provided.'}\n"
+    else:
+        cmd = bot.get_command(command)
+        help_msg = f"📌 **`{command}`**\n" + (cmd.help if cmd else "❌ Command not found.")
+    await ctx.reply(help_msg)
+
+
+### --- 🎯 ERROR HANDLING --- ###
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, CommandOnCooldown):
-        await ctx.reply(f"⏳ Cooldown! Try again in **{round(error.retry_after, 1)}s**.")
+        await ctx.reply(f"⏳ You're on cooldown! Try again in **`{round(error.retry_after, 1)}s`**.")
+    else:
+        print(f"❌ Error: {error}")
 
-# 🎭 Run Bot
+
+### --- 🚀 BOT STARTUP --- ###
 if __name__ == "__main__":
     bot.run(os.getenv("TOKEN"), reconnect=True)
+
