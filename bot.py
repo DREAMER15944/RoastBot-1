@@ -1,60 +1,32 @@
-# Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International Public License (jvherck on GitHub)
-
-import discord, os, random, json
+import discord, os, random, json, requests
 from discord.ext.commands import Bot, Context, max_concurrency, BucketType, cooldown, MemberConverter
 from discord.ext.commands.errors import CommandOnCooldown
 from dotenv import load_dotenv
 from time import sleep, time
 from roastedbyai import Conversation, MessageLimitExceeded, CharacterLimitExceeded, Style
-# from flask_site import run_app
 
 load_dotenv()
-
-# Using the bot's ID in a mention as prefix
 
 intents = discord.Intents.default()
 intents.message_content = True
 
-bot = Bot(command_prefix="r!", intents=intents,help_command=None)
+bot = Bot(command_prefix="r!", intents=intents, help_command=None)
 bot.__version__ = "1.2.0"
 mc = MemberConverter()
 
-# Storing all the roasts in a variable
+# Load roast messages from JSON
 with open("database/roast.json", "r", encoding="UTF-8") as f:
     roasts = json.load(f)
-f.close()
-
 
 @bot.event
 async def on_ready():
     print("Bot logged in as {}".format(bot.user))
 
-
-@bot.command(name="roast", description="Start an AI roast session. Take turns in roasting the AI and the AI roasting you.")
+@bot.command(name="roast", description="Start an AI roast session.")
 @max_concurrency(1, BucketType.user)
-@max_concurrency(4, BucketType.channel)
-@max_concurrency(12, BucketType.guild)
 @cooldown(1, 30, BucketType.user)
 async def _roast(ctx: Context, target: str = None, *, style: str = "default"):
-    """
-    Start an AI roast session. Take turns in roasting the AI and the AI roasting you.
-    If you want to stop, simply say "stop" or "quit".
-
-    Subcommands:
-    > - `me`: start a roast battle with the AI
-    > - `@mention` | `<username>`: roast someone else
-
-    Parameters:
-    > - `style`: the tone the AI will talk with. Possibilities: "default", "crypto_bro", "new_york", "southern_american", "south_london", "surfer_dude", "valley_girl", "adult"
-
-    Cooldown:
-    > 30 seconds per user
-
-    Concurrency:
-    > Maximum of 1 session per user at the same time
-    > Maximum of 4 sessions per channel at the same time
-    > Maximum of 12 sessions per server at the same time
-    """
+    """Start an AI roast battle."""
     if target != "me":
         try:
             target = await mc.convert(ctx, target)
@@ -62,19 +34,20 @@ async def _roast(ctx: Context, target: str = None, *, style: str = "default"):
             target = None
         await _roast_someone(ctx, target)
         return
+
     style = style.lower().replace(" ", "_")
     if style not in Style.all:
-        await ctx.reply(f"That's not a valid style. Run `{bot.command_prefix}help roast` to see the full list")
+        await ctx.reply(f"Invalid style. Run `{bot.command_prefix}help roast` for available styles.")
         return
+
     pb = PromptButtons()
     msg = await ctx.reply(
-        "We'll be taking turns in trying to roast each other. Are you sure you can handle this and want to continue?",
+        "We'll take turns roasting each other. Are you sure you can handle it?",
         view=pb
     )
     pb.msg = msg
     pb.ctx = ctx
     pb.style = style
-
 
 class PromptButtons(discord.ui.View):
     def __init__(self, *, timeout=180):
@@ -86,173 +59,113 @@ class PromptButtons(discord.ui.View):
     @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
     async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
+            await interaction.response.send_message("This isn't your battle.", ephemeral=True)
             return
-        await self.msg.edit(content="You accepted the roast battle. May the biggest chicken be the hottest roast.",
-                            view=None)
-        msg = await self.ctx.send(
-            f"{self.ctx.author.mention} Alright, give me your best roast and we'll take turns.\nIf you want to stop, simply click the button or send \"stop\" or \"quit\".")
+
+        await self.msg.edit(content="You accepted the roast battle!", view=None)
+        msg = await self.ctx.send(f"{self.ctx.author.mention} Start roasting! Type 'stop' to end.")
         await _roast_battle(self.ctx, prev_msg=msg, style=self.style)
 
-    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
-    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
-            return
-        await self.msg.edit(content="You cancelled and chickened out of the roast battle.", view=None)
-
-
-class RoastBattleCancel(discord.ui.View):
-    def __init__(self, *, timeout=180):
-        self.ctx: Context = None
-        self.convo: Conversation = None
-        super().__init__(timeout=timeout)
-
-    @discord.ui.button(label="Stop", style=discord.ButtonStyle.grey)
-    async def stop_button(self, interaction: discord.Interaction, button: discord.ui.Button):
-        if interaction.user.id != self.ctx.author.id:
-            await interaction.response.send_message("This is not your roast battle.", ephemeral=True)
-            return
-        self.convo.kill()
-        self.convo.killed = True
-        await interaction.message.edit(content=interaction.message.content, view=None)
-        await interaction.response.send_message("Boo, you're no fun.")
-        return
-
+@bot.command(name="test_network", description="Check if the bot has internet access.")
+async def test_network(ctx: Context):
+    """Check if the bot can access the internet."""
+    try:
+        response = requests.get("https://google.com")
+        await ctx.send(f"✅ Network Test Passed! Status Code: {response.status_code}")
+    except Exception as e:
+        await ctx.send(f"❌ Network Test Failed! Error: {str(e)}")
 
 async def _roast_battle(ctx: Context, prev_msg: discord.Message, *, style: str = Style.default):
+    """Handles the roast battle logic."""
     convo = Conversation(style)
 
     def check(m: discord.Message):
         return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
 
     prev_msg = None
-    while convo.alive is True:
+    while convo.alive:
         try:
             msg: discord.Message = await bot.wait_for("message", check=check, timeout=300)
+
             response = None
             while response is None:
                 try:
                     if hasattr(convo, "killed"):
-                        # on line 120 we set convo.killed to True, this attribute is not a standard attribute of the
-                        # Conversation class, so here we check if that attribute exists, and if it does, we have to
-                        # stop the command from running as the user clicked the stop button
                         return
+                    
                     await ctx.typing()
+                    
                     if msg.content.lower() in ["stop", "quit"]:
                         if prev_msg:
                             await prev_msg.edit(content=prev_msg.content, view=None)
-                        await ctx.channel.send(
-                            f"{ctx.author.mention} you're so lame bro, chickening out like this. "
-                            f"But I wouldn't want to hurt your few little braincells much more, buh-bye."
-                        )
+                        await ctx.channel.send(f"{ctx.author.mention} chickened out. Battle over!")
                         convo.kill()
                         return
-                    else:
-                        response = convo.send(msg.content)
+
+                    response = convo.send(msg.content)
+                    
+                    # Debugging log
+                    print(f"API Response: {response}")
+
+                    # Handle invalid responses
+                    if not response or not isinstance(response, str):
+                        await ctx.send("The AI failed to respond. Try again later!")
+                        convo.kill()
+                        return
+
                 except TimeoutError:
                     sleep(1)
-                    await ctx.send(f"{ctx.author.mention} I'm too tired to continue talking right now, buh-bye.")
+                    await ctx.send(f"{ctx.author.mention} I'm too tired to continue. Bye!")
                     convo.kill()
                     return
                 except MessageLimitExceeded:
-                    await ctx.reply("It's been enough roasting now, I can already smell you're starting to burn...")
+                    await ctx.reply("Enough roasting! Someone is burning...")
                     return
                 except CharacterLimitExceeded:
-                    await ctx.reply("Too much to read. Send 250 characters maximum, no need to write a whole book about me!\nCome on, try again!")
+                    await ctx.reply("Too long! Keep it under 250 characters.")
                     break
-                else:
-                    if prev_msg:
-                        await prev_msg.edit(content=prev_msg.content, view=None)
-                    rbc = RoastBattleCancel()
-                    prev_msg = await msg.reply(response, view=rbc)
-                    rbc.ctx = ctx
-                    rbc.convo = convo
+                except json.decoder.JSONDecodeError:
+                    print("⚠️ JSON Decode Error: API returned invalid JSON.")
+                    await ctx.send("Error processing response. Try again later.")
+                    return
+
+                if prev_msg:
+                    await prev_msg.edit(content=prev_msg.content, view=None)
+
+                prev_msg = await msg.reply(response)
+
         except TimeoutError:
             convo.kill()
-    if convo.alive:
-        convo.kill()
 
 async def _roast_someone(ctx: Context, target: discord.Member = None):
-    """Roast someone :smiling_imp:"""
+    """Roast a specific person."""
     if target is None:
-        dumb = [
-            "https://media.tenor.com/CZoZV7amWI8AAAAC/roast-turkey-turkey.gif",
-            "https://media.giphy.com/media/f6a97XAWuW5AA1cViz/giphy.gif",
-            "https://media.giphy.com/media/ZvwTFklWHDTozWT5CW/giphy.gif",
-            "https://media.giphy.com/media/JThXXdHrFAQ0LNsVka/giphy.gif",
-            "https://media.tenor.com/XcUy7gyqpWgAAAAd/turkey-roast.gif",
-            "https://media.tenor.com/X1bcAP-Vy_sAAAAC/roast-in-flame-boy.gif",
-            "https://media.tenor.com/pp_7aPIRIwkAAAAC/hog-hog-roast.gif",
-            "You're so stupid you even forgot to mention someone to roast, dumbass.",
-            "Cooking up the perfect roast... Roast ready at <t:{}:f>".format(
-                int(time() + random.randint(50_000, 500_000_000))),
-            "Who do you want to roast, dumbass. Next time tell me who to roast."
-        ]
-        await ctx.reply(random.choice(dumb))
+        await ctx.reply("You forgot to mention someone to roast!")
         return
     elif target.id == ctx.author.id:
-        dumb = [
-            "Look in the mirror, there's my roast. Now next time give me someone else to roast",
-            "Why do you even wanna roast yourself?",
-            "https://tenor.com/view/roast-turkey-turkey-thanksgiving-gif-18067752",
-            "You get no bitches, so lonely you're even trying to roast yourself...",
-            "Stop roasting yourself, there's so many roasts ready to use on others",
-            "Cooking up the perfect roast... Roast ready at <t:{}:f>".format(
-                int(time() + random.randint(50_000, 500_000_000))),
-            "Don't tell me there's {} other people to roast, and out of all those people you want to roast yourself??".format(
-                ctx.guild.member_count - 1),
-            "Are you okay? Do you need mental help? Why is your dumbass trying to roast itself..."
-        ]
-        await ctx.reply(random.choice(dumb))
+        await ctx.reply("Why roast yourself? Are you okay?")
         return
     elif target.id == bot.user.id:
-        dumb = [
-            "You really think I'm gonna roast myself? :joy:",
-            "You're just dumb as hell for thinking I would roast myself...",
-            "Lol no",
-            "Sike you thought. I'm not gonna roast myself, dumbass.",
-            "I'm not gonna roast myself, so instead I'll roast you.\n",
-            "Buddy, do you really think you're so funny? I might just be a Discord bot, but I'm not gonna roast myself :joy::skull:",
-            "I'm just perfect, there's nothing to roast about me :angel:"
-        ]
-        await ctx.reply(random.choice(dumb))
-    initroast = random.choice(roasts)
-    roast_expl = None
-    if type(initroast) is list:
-        _roast = initroast[0].replace("{mention}", f"**{target.display_name}**").replace("{author}",
-                                                                                         f"**{ctx.author.display_name}**")
-        roast_expl = initroast[1].replace("{mention}", f"**{target.display_name}**").replace("{author}",
-                                                                                             f"**{ctx.author.display_name}**")
+        await ctx.reply("Nice try! I won't roast myself.")
+        return
+
+    roast = random.choice(roasts)
+    if type(roast) is list:
+        roast_text = roast[0].replace("{mention}", f"**{target.display_name}**").replace("{author}", f"**{ctx.author.display_name}**")
+        roast_explanation = roast[1]
     else:
-        _roast = initroast
-    roast = f"{target.mention} " + _roast
+        roast_text = roast
 
-    def check(msg):
-        return msg.channel.id == ctx.channel.id and msg.content.lower().startswith(("what", "what?", "i dont get it", "i don't get it"))
-
-    await ctx.channel.send(roast)
-    if roast_expl:
-        try:
-            msg: discord.Message = await bot.wait_for("message", check=check, timeout=15)
-            await ctx.typing()
-            sleep(1.5)
-            await msg.reply(roast_expl)
-        except Exception as e:
-            raise e
-
+    await ctx.channel.send(f"{target.mention} {roast_text}")
 
 @bot.event
 async def on_command_error(ctx, ex):
     if isinstance(ex, CommandOnCooldown):
-        await ctx.reply(f"You're on cooldown, try again in **`{round(ex.retry_after, 1)}s`**")
-
+        await ctx.reply(f"You're on cooldown. Try again in **{round(ex.retry_after, 1)}s**")
 
 @bot.command(name="help", description="Shows the help menu.")
 async def help(ctx: Context, *, command: str = None):
-    """
-    Shows the help menu.
-    """
+    """Shows the help menu."""
     if command is None:
         helpmsg = f"# {bot.user.display_name} Help Menu\n"
         for cmd in bot.walk_commands():
@@ -262,7 +175,5 @@ async def help(ctx: Context, *, command: str = None):
         helpmsg = f"# `{command}`\n" + (cmd.help if cmd else "This command does not exist.")
     await ctx.reply(helpmsg)
 
-
 if __name__ == "__main__":
-    # run_app()
     bot.run(os.environ.get("TOKEN"), reconnect=True)
