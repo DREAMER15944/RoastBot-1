@@ -1,132 +1,122 @@
-import discord
-import os
-import random
-import json
-import requests
-from discord.ext.commands import Bot, Context, cooldown, BucketType, MemberConverter, CommandOnCooldown
+import discord, os, random, json, requests
+from discord.ext.commands import Bot, Context, max_concurrency, BucketType, cooldown, MemberConverter
+from discord.ext.commands.errors import CommandOnCooldown
 from dotenv import load_dotenv
 from time import sleep, time
 
-# Load environment variables
 load_dotenv()
 
-# Bot setup
 intents = discord.Intents.default()
 intents.message_content = True
+
 bot = Bot(command_prefix="r!", intents=intents, help_command=None)
-bot.__version__ = "1.2.3"
 mc = MemberConverter()
 
-# Logging function
-def log_message(msg):
-    print(f"[BOT LOG] {msg}")
+# Load roasts from JSON
+with open("database/roast.json", "r", encoding="UTF-8") as f:
+    roasts = json.load(f)
 
-# 🔹 Network test function
-def test_network():
-    log_message("Testing network connectivity...")
-    try:
-        response = requests.get("https://discord.com", timeout=5)
-        if response.status_code == 200:
-            log_message("✅ Internet connection working!")
-            return True
-        else:
-            log_message("⚠️ Warning: Internet may be unstable!")
-            return False
-    except requests.RequestException:
-        log_message("❌ No internet connection detected!")
-        return False
-
-# Load roast data
-try:
-    with open("database/roast.json", "r", encoding="UTF-8") as f:
-        roasts = json.load(f)
-    log_message("✅ Roast data loaded successfully!")
-except FileNotFoundError:
-    log_message("❌ Error: 'roast.json' file not found! Please check the path.")
-    exit(1)
-
-# Bot ready event
 @bot.event
 async def on_ready():
-    log_message(f"✅ Bot is online as {bot.user}")
+    print(f"✅ Bot is online as {bot.user}")
 
-# 🔹 Ping command
-@bot.command(name="ping", help="Check bot latency.")
-async def ping(ctx: Context):
-    latency = round(bot.latency * 1000)  # Convert to ms
-    await ctx.send(f"🏓 Pong! Latency: `{latency}ms`")
-
-# 🔹 Network test command
-@bot.command(name="network", help="Check internet connection.")
+# ✅ Network Check Command
+@bot.command(name="network", description="Check if the bot has internet access.")
 async def network(ctx: Context):
-    if test_network():
-        await ctx.send("✅ Network is working fine!")
-    else:
-        await ctx.send("❌ No internet connection detected!")
+    try:
+        response = requests.get("https://www.google.com", timeout=5)
+        if response.status_code == 200:
+            await ctx.reply("✅ Bot has an active internet connection!")
+        else:
+            await ctx.reply("⚠️ Bot is online but unable to reach external networks.")
+    except requests.ConnectionError:
+        await ctx.reply("❌ No internet connection detected!")
 
-# 🔹 Roast command (single roast)
-@bot.command(name="roast", description="Roast yourself or someone else!")
+# ✅ Roast Battle Interactive Command
+@bot.command(name="roast", description="Start a roast battle with the AI.")
+@max_concurrency(1, BucketType.user)
 @cooldown(1, 30, BucketType.user)
 async def roast(ctx: Context, target: str = None):
-    if target and target.lower() == "me":
+    if target == "me":
         await start_roast_battle(ctx)
-        return
-
-    if target:
+    else:
         try:
             target = await mc.convert(ctx, target)
         except:
             target = None
-    roast_target = target or ctx.author
-    roast_message = random.choice(roasts).replace("{mention}", f"**{roast_target.display_name}**")
-    await ctx.send(f"{roast_target.mention} {roast_message}")
+        await roast_someone(ctx, target)
 
-# 🔹 Interactive Roast Battle
 async def start_roast_battle(ctx: Context):
-    await ctx.send(
-        f"🔥 {ctx.author.mention}, you think you can handle this? Alright, let's take turns roasting each other!\n"
-        f"Type your best roast, or say **stop** to quit!"
+    pb = PromptButtons()
+    msg = await ctx.reply(
+        "🔥 Ready for a roast battle? I'll roast you, and you can try to roast me back! Click **Confirm** to start.",
+        view=pb
     )
+    pb.msg = msg
+    pb.ctx = ctx
 
-    def check(m):
-        return m.author.id == ctx.author.id and m.channel.id == ctx.channel.id
+async def roast_someone(ctx: Context, target: discord.Member = None):
+    if target is None:
+        await ctx.reply("Who do you want to roast? Mention them like `r!roast @user`")
+        return
+    roast = random.choice(roasts).replace("{mention}", f"**{target.display_name}**")
+    await ctx.channel.send(f"{target.mention} {roast}")
 
+class PromptButtons(discord.ui.View):
+    def __init__(self, *, timeout=180):
+        super().__init__(timeout=timeout)
+        self.msg: discord.Message = None
+        self.ctx: Context = None
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+    async def confirm_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("This is not your roast battle!", ephemeral=True)
+            return
+        await self.msg.edit(content="🔥 Roast battle started! Send your best roast.", view=None)
+        await self.ctx.send(f"{self.ctx.author.mention} You go first! Send me your best roast.")
+        await roast_battle(self.ctx)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.user.id != self.ctx.author.id:
+            await interaction.response.send_message("This is not your roast battle!", ephemeral=True)
+            return
+        await self.msg.edit(content="❌ Roast battle canceled.", view=None)
+
+async def roast_battle(ctx: Context):
     while True:
         try:
-            msg = await bot.wait_for("message", check=check, timeout=120)
+            msg = await bot.wait_for("message", check=lambda m: m.author == ctx.author, timeout=300)
             if msg.content.lower() in ["stop", "quit"]:
-                await ctx.send("😆 You chickened out! Better luck next time.")
-                return
+                await ctx.send(f"{ctx.author.mention} chickened out of the roast battle! 🐔🔥")
+                break
+            else:
+                roast = random.choice(roasts)
+                await ctx.send(roast)
+        except Exception as e:
+            print(f"Error in roast battle: {e}")
+            break
 
-            roast_response = random.choice(roasts).replace("{mention}", f"**{ctx.author.display_name}**")
-            await ctx.send(roast_response)
-
-        except TimeoutError:
-            await ctx.send("⏳ You took too long! Roast battle over.")
-            return
-
-# 🔹 Help command
-@bot.command(name="help", description="Show available commands.")
-async def help(ctx: Context):
-    help_msg = "**📜 Available Commands:**\n"
-    for command in bot.commands:
-        help_msg += f"**`{bot.command_prefix}{command.name}`** - {command.help}\n"
-    await ctx.send(help_msg)
-
-# 🔹 Error handling
+# ✅ Error Handling
 @bot.event
 async def on_command_error(ctx, error):
     if isinstance(error, CommandOnCooldown):
-        await ctx.reply(f"⏳ Cooldown active! Try again in **{round(error.retry_after, 1)}s**")
+        await ctx.reply(f"⏳ You're on cooldown! Try again in **{round(error.retry_after, 1)}s**.")
+    elif isinstance(error, discord.ext.commands.CommandNotFound):
+        await ctx.reply("❌ Invalid command! Use `r!help` for the list of commands.")
     else:
-        log_message(f"⚠️ Error: {error}")
+        print(f"⚠️ Error: {error}")
 
-# Start bot
+# ✅ Help Command
+@bot.command(name="help", description="Shows the help menu.")
+async def help(ctx: Context):
+    help_msg = "**📜 Commands:**\n"
+    help_msg += "`r!roast @user` - Roast someone 🔥\n"
+    help_msg += "`r!roast me` - Start an interactive roast battle\n"
+    help_msg += "`r!network` - Check bot's internet connection 🌐\n"
+    help_msg += "`r!help` - Show this help menu 📜\n"
+    await ctx.reply(help_msg)
+
 if __name__ == "__main__":
-    if not test_network():
-        exit(1)  # Stop bot if no network
-    TOKEN = os.getenv("TOKEN")
-    if not TOKEN:
-        log_message("❌ ERROR: Discord Bot Token not found in environment variables!")
-        exit(1)
-    bot.run(TOKEN, reconnect=True)
+    bot.run(os.getenv("TOKEN"))
